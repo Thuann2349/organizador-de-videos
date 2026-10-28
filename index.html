@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Organizador de dados do TikTok</title>
+  <style>
+    body {
+      font: 16px system-ui, sans-serif;
+      max-width: 1050px;
+      margin: 30px auto;
+      padding: 0 16px;
+      color: #222;
+    }
+    .aviso, .ajuda {
+      padding: 12px;
+      border-radius: 8px;
+      background: #f3f6fa;
+      margin: 14px 0;
+    }
+    .aviso { background: #fff5d8; }
+    .controles {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin: 18px 0;
+    }
+    input, select, button {
+      font: inherit;
+      padding: 9px;
+    }
+    button { cursor: pointer; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+    }
+    th, td {
+      text-align: left;
+      padding: 9px;
+      border-bottom: 1px solid #ddd;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th { background: #f2f2f2; }
+    .resumo { margin: 14px 0; }
+    .muted { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Organizador de dados do TikTok</h1>
+
+  <p class="aviso">
+    Segurança: esta página analisa o arquivo somente no seu navegador.
+    Não informe sua senha, códigos de verificação ou outros dados de acesso.
+  </p>
+
+  <p class="ajuda">
+    Como usar: selecione o arquivo JSON da exportação de dados do TikTok.
+    A ferramenta tentará identificar vídeos assistidos, curtidos e salvos,
+    organizar os registros por data e permitir baixar um CSV.
+  </p>
+
+  <div class="controles">
+    <label>
+      Arquivo JSON:
+      <input id="arquivo" type="file" accept=".json,application/json">
+    </label>
+
+    <label>
+      Categoria:
+      <select id="filtro">
+        <option value="todos">Todas</option>
+        <option value="assistidos">Assistidos</option>
+        <option value="curtidos">Curtidos</option>
+        <option value="salvos">Salvos/favoritos</option>
+        <option value="nao_identificados">Não identificados</option>
+      </select>
+    </label>
+
+    <label>
+      Ordem:
+      <select id="ordem">
+        <option value="desc">Mais recentes primeiro</option>
+        <option value="asc">Mais antigos primeiro</option>
+      </select>
+    </label>
+
+    <button id="baixar" disabled>Baixar CSV</button>
+  </div>
+
+  <div id="resumo" class="resumo">Selecione um arquivo JSON para começar.</div>
+  <div id="resultado"></div>
+
+<script>
+(() => {
+  const arquivoInput = document.querySelector("#arquivo");
+  const filtroInput = document.querySelector("#filtro");
+  const ordemInput = document.querySelector("#ordem");
+  const resumo = document.querySelector("#resumo");
+  const resultado = document.querySelector("#resultado");
+  const baixarButton = document.querySelector("#baixar");
+
+  let registros = [];
+
+  const normalizar = valor => String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  function categoriaPeloCaminho(caminho) {
+    const s = normalizar(caminho);
+
+    if (/favorite|favourite|bookmark|saved|salv|favorit/.test(s)) {
+      return "salvos";
+    }
+    if (/liked|like list|like history|likes|curt|heart/.test(s)) {
+      return "curtidos";
+    }
+    if (/watch|view|history|play|assist|visualiz/.test(s)) {
+      return "assistidos";
+    }
+    return null;
+  }
+
+  function dataDoObjeto(objeto) {
+    if (!objeto || typeof objeto !== "object") return null;
+
+    const prioridade = Object.entries(objeto).sort(([a], [b]) => {
+      const peso = chave => /date|time|timestamp|data|hora/i.test(chave) ? 0 : 1;
+      return peso(a) - peso(b);
+    });
+
+    for (const [chave, valor] of prioridade) {
+      if (!/date|time|timestamp|data|hora/i.test(chave)) continue;
+
+      if (typeof valor === "number" || /^\d{10,13}$/.test(String(valor))) {
+        let numero = Number(valor);
+        if (numero < 1e12) numero *= 1000;
+        const data = new Date(numero);
+        if (!Number.isNaN(data.getTime())) return data;
+      }
+
+      if (typeof valor === "string") {
+        const data = new Date(valor);
+        if (!Number.isNaN(data.getTime())) return data;
+      }
+    }
+    return null;
+  }
+
+  function textoDoObjeto(objeto) {
+    if (typeof objeto === "string") return objeto.slice(0, 500);
+    if (!objeto || typeof objeto !== "object") return "";
+
+    for (const [chave, valor] of Object.entries(objeto)) {
+      if (typeof valor === "string" &&
+          /desc|title|text|content|caption|video|item/i.test(chave) &&
+          !/^https?:\/\//i.test(valor)) {
+        return valor.slice(0, 500);
+      }
+    }
+    return "";
+  }
+
+  function urlDoObjeto(objeto) {
+    if (!objeto || typeof objeto !== "object") return "";
+
+    for (const [chave, valor] of Object.entries(objeto)) {
+      if (typeof valor !== "string") continue;
+      const corresponde = /url|link|video/i.test(chave) ||
+        /^https?:\/\//i.test(valor);
+
+      if (corresponde) {
+        const match = valor.match(/https?:\/\/[^\s"'<>]+/i);
+        if (match) return match[0].replace(/[),.;]+$/, "");
+      }
+    }
+    return "";
+  }
+
+  function adicionarRegistro(item, categoria, caminho) {
+    registros.push({
+      categoria: categoria || "nao_identificados",
+      data: dataDoObjeto(item),
+      texto: textoDoObjeto(item),
+      url: urlDoObjeto(item),
+      origem: caminho
+    });
+  }
+
+  function percorrer(valor, caminho = "") {
+    if (Array.isArray(valor)) {
+      const categoria = categoriaPeloCaminho(caminho);
+
+      for (const item of valor) {
+        if (categoria) {
+          adicionarRegistro(item, categoria, caminho);
+        } else if (item && typeof item === "object") {
+          percorrer(item, caminho);
+        } else if (typeof item === "string" && /https?:\/\//i.test(item)) {
+          adicionarRegistro({ url: item }, null, caminho);
+        }
+      }
+      return;
+    }
+
+    if (valor && typeof valor === "object") {
+      for (const [chave, filho] of Object.entries(valor)) {
+        const novoCaminho = caminho ? `${caminho}.${chave}` : chave;
+        percorrer(filho, novoCaminho);
+      }
+    }
+  }
+
+  function escapar(texto) {
+    return String(texto).replace(/[&<>"']/g, caractere => ({
+      "&": "&",
+      "<": "<",
+      ">": ">",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[caractere]));
+  }
+
+  function nomeCategoria(categoria) {
+    return {
+      assistidos: "Assistido",
+      curtidos: "Curtido",
+      salvos: "Salvo/favorito",
+      nao_identificados: "Não identificado"
+    }[categoria] || categoria;
+  }
+
+  function renderizar() {
+    const filtro = filtroInput.value;
+    const crescente = ordemInput.value === "asc";
+
+    const lista = registros
+      .filter(r => filtro === "todos" || r.categoria === filtro)
+      .sort((a, b) => {
+        const da = a.data ? a.data.getTime() : (crescente ? Infinity : -Infinity);
+        const db = b.data ? b.data.getTime() : (crescente ? Infinity : -Infinity);
+        return crescente ? da - db : db - da;
+      });
+
+    const contagem = {
+      assistidos: registros.filter(r => r.categoria === "assistidos").length,
+      curtidos: registros.filter(r => r.categoria === "curtidos").length,
+      salvos: registros.filter(r => r.categoria === "salvos").length,
+      nao_identificados: registros.filter(r => r.categoria === "nao_identificados").length
+    };
+
+    resumo.textContent =
+      `Registros encontrados: ${registros.length}. ` +
+      `Assistidos: ${contagem.assistidos}; curtidos: ${contagem.curtidos}; ` +
+      `salvos/favoritos: ${contagem.salvos}; não identificados: ${contagem.nao_identificados}.`;
+
+    if (!lista.length) {
+      resultado.innerHTML = "<p>Nenhum registro nesta categoria.</p>";
+      baixarButton.disabled = registros.length === 0;
+      return;
+    }
+
+    const linhas = lista.map(registro => {
+      const data = registro.data
+        ? registro.data.toLocaleString("pt-BR")
+        : "Data não encontrada";
+      const link = registro.url
+        ? `<a href="${escapar(registro.url)}" target="_blank" rel="noopener noreferrer">Abrir vídeo</a>`
+        : "—";
+
+      return `<tr>
+        <td>${escapar(nomeCategoria(registro.categoria))}</td>
+        <td>${escapar(data)}</td>
+        <td>${escapar(registro.texto || "—")}</td>
+        <td>${link}</td>
+      </tr>`;
+    }).join("");
+
+    resultado.innerHTML = `<table>
+      <thead>
+        <tr><th>Categoria</th><th>Data</th><th>Descrição</th><th>Link</th></tr>
+      </thead>
+      <tbody>${linhas}</tbody>
+    </table>`;
+
+    baixarButton.disabled = registros.length === 0;
+  }
+
+  arquivoInput.addEventListener("change", async () => {
+    const arquivo = arquivoInput.files?.[0];
+    if (!arquivo) return;
+
+    try {
+      const conteudo = JSON.parse(await arquivo.text());
+      registros = [];
+      percorrer(conteudo);
+      renderizar();
+
+      if (!registros.length) {
+        resumo.textContent =
+          "O JSON foi lido, mas não foram encontrados registros reconhecíveis. " +
+          "O formato pode ser diferente do esperado.";
+      }
+    } catch {
+      registros = [];
+      resultado.innerHTML = "";
+      baixarButton.disabled = true;
+      resumo.textContent =
+        "Não foi possível ler o arquivo como JSON. Confirme que selecionou um arquivo .json válido.";
+    }
+  });
+
+  filtroInput.addEventListener("change", renderizar);
+  ordemInput.addEventListener("change", renderizar);
+
+  baixarButton.addEventListener("click", () => {
+    const filtro = filtroInput.value;
+    const crescente = ordemInput.value === "asc";
+
+    const lista = registros
+      .filter(r => filtro === "todos" || r.categoria === filtro)
+      .sort((a, b) => {
+        const da = a.data ? a.data.getTime() : 0;
+        const db = b.data ? b.data.getTime() : 0;
+        return crescente ? da - db : db - da;
+      });
+
+    const linhas = [
+      ["categoria", "data", "descricao", "url", "origem"],
+      ...lista.map(r => [
+        nomeCategoria(r.categoria),
+        r.data ? r.data.toISOString() : "",
+        r.texto,
+        r.url,
+        r.origem
+      ])
+    ];
+
+    const csv = linhas.map(linha =>
+      linha.map(campo => `"${String(campo || "").replace(/"/g, '""')}"`).join(",")
+    ).join("\r\n");
+
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "dados-tiktok-organizados.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>
